@@ -1,0 +1,190 @@
+require 'uri'
+require 'net/http'
+require 'mimemagic'
+require 'json'
+require 'fileutils'
+require 'time'
+
+class AdvancedImageUpscaler
+  API_ENDPOINT = "https://api.picsart.io/tools/1.0/upscale".freeze
+  MAX_RETRIES = 3
+  SUPPORTED_FORMATS = ['JPG', 'JPEG', 'PNG', 'WEBP'].freeze  # Added JPEG explicitly
+  DEFAULT_UPSCALE_FACTOR = 2
+
+  def initialize(api_key, max_quality: 'high', model: 'general')
+    @api_key = api_key
+    @max_quality = max_quality
+    @model = model
+    validate_api_key
+  end
+
+  def upscale_image(input_path, output_path, upscale_factor: DEFAULT_UPSCALE_FACTOR, format: 'JPG')
+    # Normalize format (convert JPEG to JPG if needed)
+    format = 'JPG' if format.upcase == 'JPEG'
+    
+    unless File.exist?(input_path)
+      puts "❌ Error: Input file not found at #{input_path}"
+      return false
+    end
+
+    unless SUPPORTED_FORMATS.include?(format.upcase)
+      puts "❌ Error: Unsupported format. Use: #{SUPPORTED_FORMATS.join(', ')}"
+      return false
+    end
+
+    puts "🔍 Processing: #{File.basename(input_path)} → Upscale #{upscale_factor}x → #{format.upcase}"
+
+    retries = 0
+    begin
+      response = send_upscale_request(input_path, upscale_factor, format)
+      
+      if response.code == '200'
+        File.binwrite(output_path, response.body)
+        log_metadata(input_path, output_path, upscale_factor)
+        puts "✅ Success! Saved to: #{output_path}"
+        true
+      else
+        handle_api_error(response)
+        false
+      end
+    rescue => e
+      retries += 1
+      if retries <= MAX_RETRIES
+        puts "⚠ Retrying (#{retries}/#{MAX_RETRIES})..."
+        sleep(1)
+        retry
+      else
+        puts "❌ Failed after #{MAX_RETRIES} retries: #{e.message}"
+        false
+      end
+    end
+  end
+
+  def batch_upscale(input_dir, output_dir, upscale_factor: DEFAULT_UPSCALE_FACTOR, format: 'JPG')
+    unless Dir.exist?(input_dir)
+      puts "❌ Error: Input directory not found!"
+      return false
+    end
+
+    FileUtils.mkdir_p(output_dir) unless Dir.exist?(output_dir)
+
+    # Support both .jpg and .jpeg extensions
+    images = Dir.glob("#{input_dir}/*.{jpg,jpeg,png,webp}")
+    total = images.size
+    puts "📂 Found #{total} images to process..."
+
+    success_count = 0
+    images.each_with_index do |image_path, index|
+      output_filename = "#{File.basename(image_path, '.*')}_upscaled.#{format.downcase}"
+      output_path = "#{output_dir}/#{output_filename}"
+      puts "\n🔄 (#{index + 1}/#{total}) Processing: #{File.basename(image_path)}"
+      if upscale_image(image_path, output_path, upscale_factor: upscale_factor, format: format)
+        success_count += 1
+      end
+    end
+
+    puts "\n🎉 Batch processing complete! Success: #{success_count}/#{total}"
+    success_count > 0
+  end
+
+  private
+
+  def validate_api_key
+    if @api_key.nil? || @api_key.empty? || @api_key.include?('YOUR_API_KEY')
+      puts "⚠ WARNING: Invalid API key detected!"
+      puts "Please replace 'YOUR_API_KEY' with your actual PicsArt API key"
+    end
+  end
+
+  def send_upscale_request(input_path, upscale_factor, format)
+    url = URI(API_ENDPOINT)
+    http = Net::HTTP.new(url.host, url.port)
+    http.use_ssl = true
+    http.read_timeout = 120  # Increase timeout for large files
+
+    request = Net::HTTP::Post.new(url)
+    request["accept"] = 'application/json'
+    request["X-Picsart-API-Key"] = @api_key
+
+    boundary = "----WebKitFormBoundary#{rand(10_000_000_000)}"
+    request["content-type"] = "multipart/form-data; boundary=#{boundary}"
+
+    image_data = File.binread(input_path)
+    mime_type = MimeMagic.by_magic(image_data) || 'image/jpeg'  # Default to JPEG if detection fails
+    filename = File.basename(input_path)
+
+    body = []
+    body << "--#{boundary}\r\n"
+    body << "Content-Disposition: form-data; name=\"image\"; filename=\"#{filename}\"\r\n"
+    body << "Content-Type: #{mime_type}\r\n\r\n"
+    body << image_data
+    body << "\r\n--#{boundary}\r\n"
+    body << "Content-Disposition: form-data; name=\"upscale_factor\"\r\n\r\n"
+    body << upscale_factor.to_s
+    body << "\r\n--#{boundary}\r\n"
+    body << "Content-Disposition: form-data; name=\"format\"\r\n\r\n"
+    body << (format.upcase == 'JPEG' ? 'JPG' : format.upcase)  # Normalize to JPG
+    body << "\r\n--#{boundary}--\r\n"
+
+    request.body = body.join
+    http.request(request)
+  end
+
+  def handle_api_error(response)
+    error_message = if response.body && !response.body.empty?
+                      JSON.parse(response.body)["message"] rescue "Unknown error"
+                    else
+                      response.message
+                    end
+    puts "❌ API Error (#{response.code}): #{error_message}"
+  end
+
+  def log_metadata(input_path, output_path, upscale_factor)
+    metadata = {
+      original_file: File.basename(input_path),
+      upscaled_file: File.basename(output_path),
+      upscale_factor: upscale_factor,
+      processed_at: Time.now.iso8601,
+      original_size: "#{File.size(input_path) / 1024} KB",
+      new_size: "#{File.size(output_path) / 1024} KB"
+    }
+
+    # Try to get resolution if ImageMagick is available
+    begin
+      metadata[:original_resolution] = `identify -format "%wx%h" #{input_path.shellescape}`.strip
+      metadata[:new_resolution] = `identify -format "%wx%h" #{output_path.shellescape}`.strip
+    rescue
+      metadata[:resolution_info] = "Install ImageMagick for resolution details"
+    end
+
+    log_file = "#{File.dirname(output_path)}/upscale_metadata.json"
+    logs = File.exist?(log_file) ? JSON.parse(File.read(log_file)) : []
+    logs << metadata
+    File.write(log_file, JSON.pretty_generate(logs))
+  end
+end
+
+# ===== USAGE EXAMPLES =====
+if __FILE__ == $0
+  # Replace with your actual API key
+  api_key = 'YOUR_PICSART_API_KEY'
+
+  # Initialize upscaler with ultra quality
+  upscaler = AdvancedImageUpscaler.new(api_key, max_quality: 'ultra')
+
+  # Example 1: Single JPEG upscale
+  upscaler.upscale_image(
+    "input.jpg",          # Supports both .jpg and .jpeg
+    "output_8k.jpg",      # Output will be in JPG format
+    upscale_factor: 4,    # 4x upscaling
+    format: 'JPEG'        # You can specify either 'JPG' or 'JPEG'
+  )
+
+  # Example 2: Batch process all images in a folder
+  # upscaler.batch_upscale(
+  #   "input_images",      # Folder containing JPG/JPEG/PNG/WEBP
+  #   "output_images",     # Output folder
+  #   upscale_factor: 2,  # 2x upscaling
+  #   format: 'JPG'       # Output format
+  # )
+end
